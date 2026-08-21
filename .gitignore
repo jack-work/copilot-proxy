@@ -1,0 +1,13 @@
+# Credentials. Never commit these.
+oauth.txt
+ghe_oauth.txt
+*.token
+oauth.json
+.env
+
+# Local config and output.
+config.json
+proxy.log
+proxy-dump/
+__pycache__/
+*.pyc
