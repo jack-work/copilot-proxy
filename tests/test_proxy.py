@@ -199,22 +199,27 @@ class ProxyTests(unittest.TestCase):
         self.assertIn("No saved login", self.stderr.getvalue())
         self.network.assert_not_called()
 
-    def test_memory_cli_never_touches_keyring_and_clears_on_exit(self):
-        store = self.mock(self.p, "stored_token", side_effect=AssertionError("keyring touched"))
+    def test_memory_cli_never_touches_keyring_or_disk_and_clears_on_exit(self):
+        # stored_token is now a dispatcher that --auth memory legitimately uses,
+        # so assert on the two PERSISTENT backings instead: neither may be
+        # reached, and nothing may survive the server.
+        keyring = self.mock(self.p, "_keyring_store", side_effect=AssertionError("keyring touched"))
+        disk = self.mock(self.p, "_file_store", side_effect=AssertionError("disk touched"))
         self.mock(self.p, "device_login", return_value="oauth-secret")
         self.network.side_effect = [Response(dict(COPILOT, expires_at=9999999999))]
         server = Mock(server_address=("127.0.0.1", 8787))
         factory = self.mock(self.p, "ThreadingHTTPServer")
         factory.return_value.__enter__.return_value = server
         server.serve_forever.side_effect = lambda: self.assertEqual(self.p._oauth(), "oauth-secret")
-        self.assertEqual(self.p.main(["--memory"]), 0)
-        store.assert_not_called()
+        self.assertEqual(self.p.main(["--auth", "memory"]), 0)
+        keyring.assert_not_called()
+        disk.assert_not_called()
         self.assertIsNone(self.p._oauth_token)
         self.assertIsNone(self.p._token["value"])
 
     def test_cli_validation_precedes_network(self):
-        for args in [[], ["login", "--memory"], ["logout", "--memory"],
-                     ["--memory", "--domain", "https://github.com"], ["--memory", "--port", "70000"]]:
+        for args in [[], ["login", "--auth", "memory"], ["logout", "--auth", "memory"],
+                     ["--auth", "memory", "--domain", "https://github.com"], ["--auth", "memory", "--port", "70000"]]:
             with self.subTest(args=args), self.assertRaises(SystemExit) as result:
                 self.p.main(args)
             self.assertEqual(result.exception.code, 2)
@@ -222,12 +227,12 @@ class ProxyTests(unittest.TestCase):
 
     def test_ctrl_c_is_a_clean_exit(self):
         self.mock(self.p, "device_login", side_effect=KeyboardInterrupt)
-        self.assertEqual(self.p.main(["--memory"]), 130)
+        self.assertEqual(self.p.main(["--auth", "memory"]), 130)
         self.assertNotIn("Traceback", self.stderr.getvalue())
 
     def test_cached_token_and_renewal(self):
-        self.p.MEMORY, self.p._oauth_token = True, "oauth-secret"
-        store = self.mock(self.p, "stored_token")
+        self.p.AUTH, self.p._oauth_token = "memory", "oauth-secret"
+        store = self.mock(self.p, "_keyring_store")
         clock = self.mock(self.p.time, "time", return_value=1000)
         self.network.side_effect = [Response(COPILOT), Response(dict(COPILOT, token="new-secret", expires_at=6000))]
         self.assertEqual(self.p.copilot_token()[0], "api-secret")
@@ -239,7 +244,7 @@ class ProxyTests(unittest.TestCase):
         store.assert_not_called()
 
     def test_concurrent_requests_mint_once(self):
-        self.p.MEMORY, self.p._oauth_token = True, "oauth-secret"
+        self.p.AUTH, self.p._oauth_token = "memory", "oauth-secret"
         self.mock(self.p.time, "time", return_value=1000)
         self.network.side_effect = [Response(COPILOT)]
         with ThreadPoolExecutor(max_workers=12) as workers:
@@ -259,7 +264,7 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.network.call_count, 1)
 
     def test_malformed_token_response_does_not_partially_update_cache(self):
-        self.p.MEMORY, self.p._oauth_token = True, "oauth-secret"
+        self.p.AUTH, self.p._oauth_token = "memory", "oauth-secret"
         self.network.side_effect = [Response({"token": "secret-with-no-endpoint"})]
         with self.assertRaisesRegex(self.p.AuthError, "invalid Copilot token response"):
             self.p.copilot_token()
@@ -279,7 +284,7 @@ class ProxyTests(unittest.TestCase):
         return client
 
     def test_memory_login_to_http_inference_and_streaming(self):
-        self.p.MEMORY = True
+        self.p.AUTH = "memory"
         self.device([{"access_token": "oauth-secret"}])
         self.p._oauth_token = self.p.device_login()
         self.mock(self.p.time, "time", return_value=1000)
@@ -328,8 +333,14 @@ class ProxyTests(unittest.TestCase):
         response = client.getresponse()
         self.assertEqual(response.status, 503)
         self.assertIn("Run login", json.loads(response.read())["error"]["message"])
+        # A health probe that reports ok while the proxy cannot serve a single
+        # request is a lying probe: unauthenticated is 503, with the reason.
         client.request("GET", "/health")
-        self.assertEqual(json.loads(client.getresponse().read()), {"ok": True})
+        health = client.getresponse()
+        self.assertEqual(health.status, 503)
+        body = json.loads(health.read())
+        self.assertFalse(body["ok"])
+        self.assertIn("Run login", body["error"])
         self.network.assert_not_called()
 
     @unittest.skipUnless(os.environ.get("COPILOT_PROXY_TEST_KEYRING") == "1", "opt-in native keyring smoke test")

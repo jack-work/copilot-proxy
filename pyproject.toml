@@ -1,17 +1,28 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "copilot-anthropic-proxy"
-version = "0.1.0"
-description = "A small local Anthropic Messages API proxy for GitHub Copilot"
+version = "0.2.0"
+description = "A local Anthropic/OpenAI API proxy for GitHub Copilot"
 readme = "README.md"
 requires-python = ">=3.10"
+# keyring is needed only for --auth keyring, which is the default. --auth
+# memory and --auth file are pure stdlib.
 dependencies = ["keyring>=25,<26"]
 
 [project.scripts]
 copilot-proxy = "proxy:main"
 
-[tool.setuptools]
-py-modules = ["proxy"]
+# Flat single-module layout: proxy.py sits at the repo root, not under src/, so
+# that `python3 proxy.py` keeps working for the systemd unit and the tests.
+# uv_build cannot express this (it insists on proxy/__init__.py); hatchling can.
+[tool.hatch.build.targets.wheel]
+only-include = ["proxy.py"]
+
+# Replaces MANIFEST.in, which was setuptools-only and the last reason this
+# project needed setuptools at all.
+[tool.hatch.build.targets.sdist]
+include = ["proxy.py", "tests/", "README.md", ".env.example", "config.example.json"]
+exclude = ["**/__pycache__"]

@@ -1,5 +1,6 @@
 {
   "domain": "github.com",
+  "auth": "keyring",
   "account": "YOUR_GITHUB_LOGIN",
   "port": 8787,
   "bind": "127.0.0.1"

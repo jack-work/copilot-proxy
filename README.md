@@ -1,14 +1,16 @@
 # copilot-anthropic-proxy
 
-A small local proxy: speak the **Anthropic Messages API** to **GitHub Copilot**.
-One Python module; `keyring` is its only direct dependency. Python 3.10+.
+A small local proxy: speak the **Anthropic Messages API** — and the OpenAI
+shapes Copilot also serves — to **GitHub Copilot**. One Python module;
+`keyring` is its only direct dependency, and only for `--auth keyring`.
+Python 3.10+, Windows and Linux (and macOS).
 
 ## Run without installing globally
 
 With [uv](https://docs.astral.sh/uv/), from this checkout, on Linux, Windows or macOS:
 
 ```sh
-uvx --from . copilot-proxy --memory
+uvx --from . copilot-proxy --auth memory
 ```
 
 Open the printed GitHub URL, enter the code and approve. The proxy then listens
@@ -16,12 +18,12 @@ on **http://127.0.0.1:8787**. Both credentials stay in this process; restarting
 requires approval again. No token file, keyring access or browser automation.
 `uvx` caches the package/dependencies, **not your credentials**.
 
-Memory mode also works with just Python: `python proxy.py --memory`.
+Memory mode also works with just Python: `python proxy.py --auth memory`.
 
 Once these changes are pushed, running directly from Git works too:
 
 ```sh
-uvx --from git+https://github.com/jack-work/copilot-proxy.git copilot-proxy --memory
+uvx --from git+https://github.com/jack-work/copilot-proxy.git copilot-proxy --auth memory
 ```
 
 No PyPI publication is required. Pin the Git URL to a commit (`.git@<commit>`)
@@ -47,9 +49,10 @@ namespaced by GitHub host and account:
 | Linux / WSL | Secret Service (e.g. GNOME Keyring), with session D-Bus |
 
 The store must be available and unlocked (it may show an OS unlock prompt).
-There is **no plaintext or alternate-backend fallback**; use `--memory` if you
-do not have a usable store. This is a foreground, signed-in-user tool, not an
-unattended boot service. Windows and WSL use **separate** credential stores.
+There is **no plaintext or alternate-backend fallback**: a locked keyring fails
+loudly instead of silently downgrading. Use `--auth memory` if you do not have
+a usable store, or `--auth file` for an unattended service. Windows and WSL use
+**separate** credential stores.
 
 Stop running proxies with Ctrl+C, then remove the saved login:
 
@@ -70,13 +73,37 @@ Flags override environment variables, then `.env` (`./.env` or
 | Flag | Environment | JSON key | Default |
 |---|---|---|---|
 | `--domain` | `COPILOT_DOMAIN` | `domain` | `github.com` |
-| `--account` | `COPILOT_ACCOUNT` | `account` | required except in memory mode |
+| `--account` | `COPILOT_ACCOUNT` | `account` | required for `--auth keyring` |
+| `--auth` | `COPILOT_AUTH` | `auth` | `keyring` |
+| `--oauth-file` | `COPILOT_OAUTH_FILE` | `oauth_file` | `<config dir>/oauth.txt` |
 | `--port` | `PORT` | `port` | `8787` |
 | `--bind` | `BIND` | `bind` | `127.0.0.1` |
-| — | `PROXY_DUMP_DIR` | `dump_dir` | off |
+| `--dump-dir` | `PROXY_DUMP_DIR` | `dump_dir` | off |
+| `--request-log` | `PROXY_REQUEST_LOG` | `request_log` | off |
 
-`--memory` is an explicit serve-only flag. `serve` is the default command;
-`login` and `logout` manage saved credentials. `--help` lists the options.
+The config dir is `%APPDATA%\copilot-proxy` on Windows and
+`$XDG_CONFIG_HOME/copilot-proxy` (default `~/.config/copilot-proxy`) elsewhere.
+
+`serve` is the default command; `login` and `logout` manage saved credentials.
+`--help` lists the options.
+
+### Where the OAuth token lives: `--auth`
+
+| Mode | Stored in | Survives a reboot | Use for |
+|---|---|---|---|
+| `keyring` (default) | OS credential store | yes | interactive use |
+| `memory` | this process only | no | a one-off; nothing touches disk |
+| `file` | a 0600 file | yes | an unattended service |
+
+There is **no fallback chain between them**: a locked keyring fails loudly
+rather than silently becoming a plaintext file. Device login is built in for
+all three — `login` runs it and saves, `--auth memory` runs it at startup and
+keeps the result in memory.
+
+> **Why not MSAL?** It is an Entra ID client and rejects a GitHub authority
+> outright. The credential here is a GitHub App user-to-server token (`ghu_`)
+> from GitHub's own device flow, exchanged at `/copilot_internal/v2/token`.
+> Different issuer, different protocol. The built-in flow is stdlib only.
 
 For GitHub Enterprise Cloud, add `--domain your-tenant.ghe.com` to **both**
 login and serve/logout. OAuth goes to that host and API requests to its `api.`
@@ -92,8 +119,9 @@ uv run python tests/smoke.py
 ```
 
 Or use any Anthropic-compatible client with base URL `http://127.0.0.1:8787`;
-the caller's API key is ignored. `GET /health` checks local liveness only,
-not current upstream authorization. The smoke test makes one real inference
+the caller's API key is ignored. `GET /health` mints or reuses a Copilot
+token and reports the live credential state, so it returns 503 with a reason
+when the proxy could not serve a request. The smoke test makes one real inference
 request (uses quota); pass `--model` if you need a different enabled model.
 If testing Windows and WSL simultaneously, use `--port 8788` for one proxy
 and pass the same port to the smoke test.
@@ -107,8 +135,13 @@ on demand within five minutes of expiry. Invalid OAuth credentials require
 another explicit login; HTTP handlers never initiate browser approval.
 
 Requests pass through in native Anthropic format (including SSE and tools).
-The proxy replaces authorization/editor headers and maps dashed model versions
-to Copilot's dotted IDs. An upstream 401 invalidates the cache for the **next**
+**Every path except `/health` and `/healthz` is forwarded verbatim**, for GET,
+POST and DELETE, so `/v1/messages`, `/chat/completions`, `/responses` and
+`/models` all work and a Copilot endpoint this proxy has never heard of needs
+no code change. Note the asymmetry, which is the upstream's and not ours: the
+Anthropic shape is under `/v1/`, the rest sit at the root. The proxy replaces
+authorization/editor headers and maps dashed model versions to Copilot's
+dotted IDs when — and only when — the body names a model. An upstream 401 invalidates the cache for the **next**
 request; POSTs are never automatically replayed. No rate limiting or queueing.
 
 **Keep the loopback binding.** This proxy has no client authentication; anyone
