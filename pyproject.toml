@@ -8,9 +8,22 @@ version = "0.2.0"
 description = "A local Anthropic/OpenAI API proxy for GitHub Copilot"
 readme = "README.md"
 requires-python = ">=3.10"
-# keyring is needed only for --auth keyring, which is the default. --auth
-# memory and --auth file are pure stdlib.
-dependencies = ["keyring>=25,<26"]
+# NO REQUIRED DEPENDENCIES, deliberately. --auth memory and --auth file are
+# pure stdlib, so the common path installs nothing and `uvx --from git+...`
+# works on a network that cannot reach PyPI's package CDN.
+#
+# keyring was a hard dependency until 2026-09-21 and cost seven downloads
+# (keyring, jaraco-classes, jaraco-context, jaraco-functools, more-itertools,
+# pywin32-ctypes, setuptools). On a restricted Windows network that fetch fails
+# and the whole tool is unrunnable, including the modes that never needed it.
+# The code already degrades correctly: a missing keyring reports itself as a
+# missing library and names the other two modes.
+dependencies = []
+
+[project.optional-dependencies]
+# `uvx --from "copilot-anthropic-proxy[keyring]"`, or install the extra, when
+# you want the credential in the OS store rather than memory or a file.
+keyring = ["keyring>=25,<26"]
 
 [project.scripts]
 copilot-proxy = "proxy:main"

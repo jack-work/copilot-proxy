@@ -2,7 +2,8 @@
 
 A small local proxy: speak the **Anthropic Messages API** — and the OpenAI
 shapes Copilot also serves — to **GitHub Copilot**. One Python module;
-`keyring` is its only direct dependency, and only for `--auth keyring`.
+**No required dependencies** — `--auth memory` and `--auth file` are pure
+stdlib, so `uvx` installs nothing. `--auth keyring` needs the `keyring` extra.
 Python 3.10+, Windows and Linux (and macOS).
 
 ## Run without installing globally
@@ -12,6 +13,17 @@ With [uv](https://docs.astral.sh/uv/), from this checkout, on Linux, Windows or 
 ```sh
 uvx --from . copilot-proxy --auth memory
 ```
+
+For the OS credential store, ask for the extra:
+
+```sh
+uvx --from ".[keyring]" copilot-proxy login --account YOUR_GITHUB_LOGIN
+```
+
+The extra pulls seven packages (`keyring` plus its `jaraco-*` chain). On a
+restricted network that cannot reach PyPI's package CDN, the dependency-free
+modes still work and the keyring mode will not — the proxy says so explicitly
+rather than reporting a locked keyring.
 
 Open the printed GitHub URL, enter the code and approve. The proxy then listens
 on **http://127.0.0.1:8787**. Both credentials stay in this process; restarting
