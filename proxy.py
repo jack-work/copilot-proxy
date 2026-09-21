@@ -529,7 +529,25 @@ _INT_RE = {
 
 def _usage_facts(text):
     """LAST usage object wins: an SSE stream emits several and only the terminal
-    one is complete. Regex rather than a parser because the SSE body is not JSON."""
+    one is complete. Regex rather than a parser because the SSE body is not JSON.
+
+    Emits NORMALIZED `cache_read`, `cache_write` and `prompt_total` alongside
+    the raw provider fields. Two wires name the same quantity differently and
+    COUNT IT DIFFERENTLY, which makes a naive query silently wrong:
+
+      Anthropic  cache_read_input_tokens, cache_creation_input_tokens
+                 `input_tokens` EXCLUDES cached tokens
+      OpenAI     cached_tokens, cache_write_tokens
+                 `input_tokens` INCLUDES cached tokens
+
+    So a hit rate of cached/input is right on one wire and nonsense on the
+    other, and asking for the wrong field name returns nothing rather than an
+    error. This cost a false finding on 2026-09-21: 458,717 cache-read tokens
+    across 50 requests were reported as "caching does not work here" purely
+    because the query asked for the Anthropic name on OpenAI records.
+    `prompt_total` is always the whole prompt including cached tokens, so
+    `cache_read / prompt_total` is a hit rate on either wire.
+    """
     out = {}
     last = None
     for m in _USAGE_RE.finditer(text):
@@ -541,6 +559,18 @@ def _usage_facts(text):
         hit = rx.search(seg)
         if hit:
             out[name] = int(hit.group(1))
+
+    anthropic = "cache_read_input_tokens" in out or "cache_creation_input_tokens" in out
+    for norm, names in (("cache_read", ("cache_read_input_tokens", "cached_tokens")),
+                        ("cache_write", ("cache_creation_input_tokens", "cache_write_tokens"))):
+        for name in names:
+            if name in out:
+                out[norm] = out[name]
+                break
+    if "input_tokens" in out:
+        # Anthropic reports the uncached remainder; add the cached part back so
+        # the two wires can be compared without knowing which one produced it.
+        out["prompt_total"] = out["input_tokens"] + (out.get("cache_read", 0) if anthropic else 0)
     return out
 
 
@@ -572,6 +602,19 @@ def wire_of(path):
     if "chat/completions" in path:
         return "openai-chat"
     return "other"
+
+
+def client_facts(handler):
+    """Who is calling. The request log had no caller identity at all, which on
+    2026-09-21 turned "which client produced this burst of traffic?" into an
+    inference from context rather than a lookup. Address and User-Agent only:
+    both are already in the request, neither is a secret, and the log has to
+    stay safe to leave on."""
+    facts = {"client_addr": handler.client_address[0]}
+    agent = handler.headers.get("User-Agent")
+    if agent:
+        facts["client"] = agent[:200]
+    return facts
 
 
 # --- SERVER ------------------------------------------------------------------
@@ -683,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             started = time.time()
             rec = {"ts": started, "path": self.path, "method": method,
                    "wire": wire_of(self.path)}
+            rec.update(client_facts(self))
             rec.update(_req_facts(raw))
 
             try:

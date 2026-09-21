@@ -272,13 +272,82 @@ class RequestLogTests(Base):
                            ("/v1/embeddings", "other")]:
             self.assertEqual(self.p.wire_of(path), wire)
 
+    def test_normalized_cache_fields_span_both_wires(self):
+        """The regression this exists for: on 2026-09-21 a query asked for the
+        Anthropic field name on OpenAI records, got nothing back, and reported
+        458,717 cache-read tokens as "caching does not work here"."""
+        anthropic = ('{"usage":{"input_tokens":2,"output_tokens":227,'
+                     '"cache_read_input_tokens":42636,'
+                     '"cache_creation_input_tokens":11}}')
+        openai = ('{"usage":{"input_tokens":30512,"output_tokens":516,'
+                  '"cached_tokens":27274,"cache_write_tokens":3163}}')
+
+        a = self.p._usage_facts(anthropic)
+        o = self.p._usage_facts(openai)
+
+        # Same normalized names on both wires.
+        self.assertEqual(a["cache_read"], 42636)
+        self.assertEqual(o["cache_read"], 27274)
+        self.assertEqual(a["cache_write"], 11)
+        self.assertEqual(o["cache_write"], 3163)
+
+        # And the raw provider fields are still there, unrenamed.
+        self.assertEqual(a["cache_read_input_tokens"], 42636)
+        self.assertEqual(o["cached_tokens"], 27274)
+
+        # prompt_total must account for the wires COUNTING differently:
+        # Anthropic's input_tokens excludes the cached part, OpenAI's includes
+        # it. Without this, a hit rate is right on one wire and absurd on the
+        # other -- 42636/2 = 21318x on the Anthropic record.
+        self.assertEqual(a["prompt_total"], 2 + 42636)
+        self.assertEqual(o["prompt_total"], 30512)
+        for label, facts in (("anthropic", a), ("openai", o)):
+            with self.subTest(wire=label):
+                rate = facts["cache_read"] / facts["prompt_total"]
+                self.assertTrue(0.0 <= rate <= 1.0, "%s rate %r" % (label, rate))
+
+    def test_usage_without_cache_fields_still_reports_prompt_total(self):
+        facts = self.p._usage_facts('{"usage":{"input_tokens":15,"output_tokens":9}}')
+        self.assertEqual(facts["prompt_total"], 15)
+        self.assertNotIn("cache_read", facts)
+
+    def test_log_names_the_caller(self):
+        """Without this the only answer to "who sent this burst?" is a guess."""
+        with tempfile.TemporaryDirectory() as d:
+            self.p.REQUEST_LOG = os.path.join(d, "requests.ndjson")
+            client = self.serving()
+            self.network.side_effect = [Response({"ok": True})]
+            client.request("POST", "/v1/messages", '{"model":"claude-sonnet-4.6"}',
+                           {"User-Agent": "cowork-cli/2.0.27"})
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            rec = json.loads(self.await_log())
+        self.assertEqual(rec["client"], "cowork-cli/2.0.27")
+        self.assertEqual(rec["client_addr"], "127.0.0.1")
+
+    def test_caller_identity_is_bounded_and_optional(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.p.REQUEST_LOG = os.path.join(d, "requests.ndjson")
+            client = self.serving()
+            self.network.side_effect = [Response({"ok": True})]
+            # http.client always sends a User-Agent unless told otherwise; an
+            # absurd one must not be able to bloat the log line.
+            client.request("POST", "/v1/messages", "{}", {"User-Agent": "x" * 5000})
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            rec = json.loads(self.await_log())
+        self.assertEqual(len(rec["client"]), 200)
+
     def test_last_usage_object_wins_in_a_stream(self):
         """An SSE body emits several usage objects and only the terminal one
         is complete; a first-match read reports the wrong numbers."""
         sse = ('data: {"usage":{"input_tokens":5,"output_tokens":0}}\n\n'
                'data: {"usage":{"input_tokens":5,"output_tokens":42}}\n\n')
-        self.assertEqual(self.p._usage_facts(sse),
-                         {"input_tokens": 5, "output_tokens": 42})
+        facts = self.p._usage_facts(sse)
+        self.assertEqual(facts["output_tokens"], 42, "took a non-terminal usage object")
+        self.assertEqual(facts["input_tokens"], 5)
 
 
 if __name__ == "__main__":
