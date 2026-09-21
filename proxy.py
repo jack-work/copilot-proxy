@@ -225,7 +225,21 @@ def _keyring_store(action, value=None):
         "darwin": ("macOS", "Keyring"),
     }.get(sys.platform, ("SecretService", "Keyring"))
     try:
-        store = getattr(importlib.import_module("keyring.backends." + module), name)()
+        backend = importlib.import_module("keyring.backends." + module)
+    except ImportError:
+        # DISTINCT FROM A LOCKED STORE, and worth its own message: reporting
+        # "unavailable or locked" when the library is simply absent sends the
+        # reader to unlock a keyring that was never the problem. Measured
+        # 2026-09-21 against a bare interpreter whose Secret Service was
+        # demonstrably unlocked and answering secret-tool at that moment.
+        raise AuthError(
+            "The `keyring` library is not importable by this interpreter, so "
+            "--auth keyring cannot work here. This is NOT a locked keyring. "
+            "Install this package with uv/uvx, or run it with an interpreter "
+            "that carries keyring, or choose --auth memory / --auth file."
+        ) from None
+    try:
+        store = getattr(backend, name)()
         service = APP + ":" + DOMAIN
         if action == "get":
             return store.get_password(service, ACCOUNT)
@@ -237,8 +251,7 @@ def _keyring_store(action, value=None):
         raise AuthError(
             "OS credential store unavailable or locked. Unlock your keyring "
             "(Linux needs Secret Service and a session D-Bus), or use "
-            "--auth memory, or --auth file for an unattended service. "
-            "Install this package with uv/uvx to include keyring."
+            "--auth memory, or --auth file for an unattended service."
         ) from None
 
 

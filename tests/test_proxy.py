@@ -156,18 +156,29 @@ class ProxyTests(unittest.TestCase):
                     store.get_password.assert_called_with("copilot-proxy:tenant.ghe.com", "octocat")
                     store.delete_password.assert_called_once_with("copilot-proxy:tenant.ghe.com", "octocat")
 
-    def test_keyring_unavailable_or_locked_has_no_fallback(self):
+    def test_keyring_failures_are_distinguished_and_have_no_fallback(self):
         store = Mock()
         store.get_password.side_effect = RuntimeError("secret error details")
         backend = types.SimpleNamespace(Keyring=Mock(return_value=store), WinVaultKeyring=Mock(return_value=store))
-        for failure in [ImportError("missing keyring"), backend]:
-            with self.subTest(failure=type(failure).__name__), patch.object(
+        # A MISSING LIBRARY AND A LOCKED STORE ARE DIFFERENT PROBLEMS. Saying
+        # "locked" for the first sends the reader to unlock a keyring that was
+        # never at fault -- measured 2026-09-21 against an interpreter without
+        # keyring whose Secret Service was answering secret-tool at the time.
+        for failure, expected in [(ImportError("missing keyring"), "not importable"),
+                                  (backend, "unavailable or locked")]:
+            with self.subTest(expected=expected), patch.object(
                 self.p.importlib, "import_module", side_effect=[failure]
             ), patch.object(builtins, "open") as files:
-                with self.assertRaisesRegex(self.p.AuthError, "unavailable or locked") as result:
+                with self.assertRaisesRegex(self.p.AuthError, expected) as result:
                     self.p.stored_token("get")
                 self.assertNotIn("secret error details", str(result.exception))
                 files.assert_not_called()
+        # And the missing-library message must not also claim "locked".
+        with patch.object(self.p.importlib, "import_module",
+                          side_effect=[ImportError("missing keyring")]):
+            with self.assertRaises(self.p.AuthError) as result:
+                self.p.stored_token("get")
+        self.assertNotIn("unavailable or locked", str(result.exception))
         self.network.assert_not_called()
 
     def test_logout_missing_credential_is_idempotent(self):
