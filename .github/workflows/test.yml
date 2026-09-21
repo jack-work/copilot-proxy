@@ -1,0 +1,37 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.10', '3.14']
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv run python -m unittest discover -s tests -v
+      - run: uv build
+      - run: uvx --from . copilot-proxy --help
+      - name: Native keyring (Windows / macOS)
+        if: runner.os != 'Linux'
+        env:
+          COPILOT_PROXY_TEST_KEYRING: '1'
+        run: uv run python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
+      - name: Native keyring (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring dbus-x11
+          dbus-run-session -- bash -ec '
+            printf "%s" "test-only-password" | gnome-keyring-daemon --unlock --components=secrets
+            COPILOT_PROXY_TEST_KEYRING=1 uv run python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
+          '

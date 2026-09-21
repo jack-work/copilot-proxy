@@ -11,22 +11,26 @@ translating shim: it forwards the request body byte-for-byte and only
   3. rewrites the model id -- callers tend to use dashes
      (claude-sonnet-4-6) where Copilot uses dots (claude-sonnet-4.6).
 
-That is the whole program. It is standard-library Python with no dependencies.
+GitHub device login is built in. OAuth credentials live in the OS keyring
+(the only dependency), or solely in this process with --memory.
 
 CONFIGURATION, highest precedence first:
 
-  1. environment variables
-  2. a .env file (./.env, or $COPILOT_PROXY_ENV)
-  3. config.json in $XDG_CONFIG_HOME/copilot-proxy (default ~/.config/...)
-  4. the defaults below
+  1. command-line flags
+  2. environment variables
+  3. a .env file (./.env, or $COPILOT_PROXY_ENV)
+  4. config.json in $XDG_CONFIG_HOME/copilot-proxy (default ~/.config/...)
+  5. the defaults below
 
-Keys: domain, oauth_file, port, bind, dump_dir. As environment variables they
-are COPILOT_DOMAIN, COPILOT_OAUTH_FILE, PORT, BIND, PROXY_DUMP_DIR.
+Keys: domain, account, port, bind, dump_dir. As environment variables they
+are COPILOT_DOMAIN, COPILOT_ACCOUNT, PORT, BIND, PROXY_DUMP_DIR.
 
 To point this at a GitHub Enterprise tenant, set the domain to that host, e.g.
 `COPILOT_DOMAIN=your-tenant.ghe.com`. Everything else is derived from it.
 """
 
+import argparse
+import importlib
 import json
 import os
 import re
@@ -34,10 +38,12 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "copilot-proxy"
+CLIENT_ID = "Iv1.b507a08c87ecfe98"  # Public VS Code Copilot OAuth client.
 
 
 def config_dir():
@@ -106,10 +112,10 @@ def setting(key, env_var, default=None):
 # github.com is the default. Set the domain to a GitHub Enterprise host to use
 # that tenant instead; the API and OAuth URLs are derived from it.
 DOMAIN = setting("domain", "COPILOT_DOMAIN", "github.com")
-OAUTH_FILE = setting(
-    "oauth_file", "COPILOT_OAUTH_FILE", os.path.join(config_dir(), "oauth.txt")
-)
-PORT = int(setting("port", "PORT", "8787"))
+ACCOUNT = setting("account", "COPILOT_ACCOUNT")
+MEMORY = False
+_oauth_token = None
+PORT = setting("port", "PORT", "8787")
 # Loopback by default: this proxy holds a credential and has NO authentication
 # of its own, so it must not be reachable off the machine without a decision.
 # Containers that need it (Docker's host.docker.internal) require "0.0.0.0".
@@ -138,15 +144,105 @@ _token = {"value": None, "exp": 0.0, "api": None}
 _models_cache = {"ids": None, "at": 0.0}
 
 
-def _oauth():
+class AuthError(Exception):
+    pass
+
+
+def stored_token(action, value=None):
+    """Use only native OS stores, never an auto-selected plaintext backend."""
+    module, name = {
+        "win32": ("Windows", "WinVaultKeyring"),
+        "darwin": ("macOS", "Keyring"),
+    }.get(sys.platform, ("SecretService", "Keyring"))
     try:
-        with open(OAUTH_FILE, encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        raise SystemExit(
-            "No OAuth token at %s.\nSee the README: obtain one with the device "
-            "flow, then write it there with mode 0600." % OAUTH_FILE
-        )
+        store = getattr(importlib.import_module("keyring.backends." + module), name)()
+        service = APP + ":" + DOMAIN
+        if action == "get":
+            return store.get_password(service, ACCOUNT)
+        if action == "set":
+            store.set_password(service, ACCOUNT, value)
+        elif action == "delete" and store.get_password(service, ACCOUNT) is not None:
+            store.delete_password(service, ACCOUNT)
+    except Exception:
+        raise AuthError(
+            "OS credential store unavailable or locked. Unlock your keyring "
+            "(Linux needs Secret Service and a session D-Bus), or use --memory. "
+            "Install this package with uv/uvx to include keyring."
+        ) from None
+
+
+def github(path, token=None, data=None, timeout=30):
+    """GitHub JSON requests. Do not expose response bodies or credentials in errors."""
+    headers = dict(EDITOR_HEADERS, Accept="application/json")
+    if token:
+        headers["Authorization"] = "token " + token
+    host = "api." + DOMAIN if token else DOMAIN
+    raw = urllib.parse.urlencode(data).encode() if data is not None else None
+    req = urllib.request.Request("https://" + host + path, data=raw, headers=headers)
+    try:
+        try:
+            response = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and data is not None:
+                response = e  # OAuth errors may be JSON in a 400 response.
+            elif e.code == 401:
+                raise AuthError("GitHub rejected the OAuth credential. Run login again "
+                                "with the same --domain/--account, or restart --memory.") from None
+            elif e.code == 403:
+                raise AuthError("GitHub denied access. Check Copilot access, tenant/SSO "
+                                "policy and the selected --domain/--account.") from None
+            else:
+                raise AuthError("GitHub request failed (HTTP %d). Try again." % e.code) from None
+        with response:
+            body = json.load(response)
+        if not isinstance(body, dict):
+            raise ValueError()
+        return body
+    except (OSError, ValueError):
+        raise AuthError("GitHub request failed: network error or invalid JSON. Try again.") from None
+
+
+def device_login():
+    body = github("/login/device/code", data={"client_id": CLIENT_ID, "scope": "read:user"})
+    try:
+        code = body["device_code"]
+        interval = max(1, float(body.get("interval", 5)))
+        deadline = time.monotonic() + float(body["expires_in"])
+        log("Approve at %s -- code: %s" % (body["verification_uri"], body["user_code"]))
+    except (KeyError, TypeError, ValueError):
+        raise AuthError("Could not start GitHub device login. Check the domain and try again.") from None
+    while time.monotonic() + interval < deadline:
+        time.sleep(interval)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        body = github("/login/oauth/access_token", data={
+            "client_id": CLIENT_ID, "device_code": code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        }, timeout=min(30, remaining))
+        if body.get("access_token"):
+            token = body["access_token"]
+            if ACCOUNT and github("/user", token=token).get("login", "").lower() != ACCOUNT:
+                raise AuthError("Approved account does not match --account; nothing saved. Try again.")
+            return token
+        error = body.get("error")
+        if error == "slow_down":
+            interval = max(interval + 5, float(body.get("interval", 0)))
+        elif error == "expired_token":
+            break
+        elif error == "access_denied":
+            raise AuthError("GitHub login was denied. Run login or --memory again to retry.")
+        elif error != "authorization_pending":
+            raise AuthError("GitHub device login failed. Request a new code and try again.")
+    raise AuthError("GitHub device code expired. Run login or --memory again for a new code.")
+
+
+def _oauth():
+    value = _oauth_token if MEMORY else stored_token("get")
+    if not value:
+        raise AuthError("No saved login for %s on %s. Run login with the same "
+                        "--domain/--account, or use --memory." % (ACCOUNT, DOMAIN))
+    return value
 
 
 def copilot_token():
@@ -154,18 +250,17 @@ def copilot_token():
     with _lock:
         if _token["value"] and time.time() < _token["exp"] - 300:
             return _token["value"], _token["api"]
-        h = dict(EDITOR_HEADERS)
-        h["Authorization"] = "token " + _oauth()
-        req = urllib.request.Request(
-            "https://api.%s/copilot_internal/v2/token" % DOMAIN, headers=h
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = json.loads(r.read().decode("utf-8"))
-        _token["value"] = body["token"]
-        _token["exp"] = float(body.get("expires_at", time.time() + 1500))
-        _token["api"] = body["endpoints"]["api"]
-        log("minted copilot token, expires in %ds" % int(_token["exp"] - time.time()))
-        return _token["value"], _token["api"]
+        body = github("/copilot_internal/v2/token", token=_oauth())
+        try:
+            value, api = body["token"], body["endpoints"]["api"]
+            exp = float(body.get("expires_at", time.time() + 1500))
+            if not value or not api.startswith("https://") or exp <= time.time():
+                raise ValueError()
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise AuthError("GitHub returned an invalid Copilot token response. Check Copilot access.") from None
+        _token.update(value=value, exp=exp, api=api)
+        log("minted copilot token, expires in %ds" % int(exp - time.time()))
+        return value, api
 
 
 def model_ids(api_base, token):
@@ -228,9 +323,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            token, api_base = copilot_token()
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
+            token, api_base = copilot_token()
 
             streaming = False
             try:
@@ -269,6 +364,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 upstream = urllib.request.urlopen(req, timeout=600)
             except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    with _lock:
+                        if _token["value"] == token:
+                            _token["value"] = None  # Renew on the next request; never replay a POST.
                 body = e.read()
                 log("upstream %s on %s: %s" % (e.code, self.path, body[:200]))
                 self.send_response(e.code)
@@ -302,23 +401,65 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log("handler error: %r" % e)
             try:
-                self._fail(502, "proxy failure: %s" % e)
+                self._fail(503 if isinstance(e, AuthError) else 502, "proxy failure: %s" % e)
             except Exception:
                 pass
 
 
-def main():
-    log("domain %s | oauth %s" % (DOMAIN, OAUTH_FILE))
-    if DUMP_DIR:
-        log("REQUEST DUMPING IS ON -> %s (prompt content written in the clear)" % DUMP_DIR)
-    token, api = copilot_token()
-    log("upstream %s" % api)
-    log("listening on http://%s:%d  (POST /v1/messages)" % (BIND, PORT))
-    if BIND not in ("127.0.0.1", "localhost", "::1"):
-        log("NOTE: bound to %s -- reachable off this machine, and this proxy "
-            "has no auth of its own." % BIND)
-    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+def main(argv=None):
+    global DOMAIN, ACCOUNT, MEMORY, _oauth_token
+    parser = argparse.ArgumentParser(
+        prog=APP, description="Anthropic Messages API via GitHub Copilot.",
+        epilog="Quick start without saved credentials: copilot-proxy --memory",
+    )
+    parser.add_argument("command", nargs="?", choices=("serve", "login", "logout"), default="serve",
+                        help="serve (default), save a GitHub login, or remove a saved login")
+    parser.add_argument("--memory", action="store_true", help="serve with device login; never read/write the keyring")
+    parser.add_argument("--domain", default=DOMAIN, help="GitHub host (default: github.com)")
+    parser.add_argument("--account", default=ACCOUNT, help="GitHub username; required unless --memory")
+    parser.add_argument("--bind", default=BIND, help="listen address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=PORT, help="listen port (default: 8787)")
+    args = parser.parse_args(argv)
+    if args.memory and args.command != "serve":
+        parser.error("--memory is for serve: login/logout manage persistent credentials")
+    if not args.memory and not args.account:
+        parser.error("--account (or COPILOT_ACCOUNT) is required for keyring storage; alternatively use --memory")
+    DOMAIN, ACCOUNT, MEMORY = args.domain.lower(), args.account.lower() if args.account else None, args.memory
+    if not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", DOMAIN):
+        parser.error("--domain must be a hostname, without a scheme, port or path")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
+    try:
+        if args.command == "logout":
+            stored_token("delete")
+            log("Saved credential removed. Stop running proxies to discard their cached tokens.")
+            return 0
+        if args.command == "login":
+            stored_token("get")  # Check store availability before asking for approval.
+            stored_token("set", device_login())
+            log("Saved login for %s on %s in the OS keyring." % (ACCOUNT, DOMAIN))
+            return 0
+        if MEMORY:
+            _oauth_token = device_login()
+        if DUMP_DIR:
+            log("REQUEST DUMPING IS ON -> %s (prompt content written in the clear)" % DUMP_DIR)
+        _, api = copilot_token()
+        log("upstream %s" % api)
+        if args.bind not in ("127.0.0.1", "localhost", "::1"):
+            log("NOTE: bound to %s -- reachable off this machine, and this proxy has no auth." % args.bind)
+        with ThreadingHTTPServer((args.bind, args.port), Handler) as server:
+            log("listening on http://%s:%d  (POST /v1/messages)" % server.server_address[:2])
+            server.serve_forever()
+    except (AuthError, OSError) as e:
+        log(str(e))
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        _oauth_token = None
+        _token.update(value=None, exp=0.0, api=None)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,16 +1,6 @@
 {
-  "_comment": "Copy to $XDG_CONFIG_HOME/copilot-proxy/config.json (default ~/.config/copilot-proxy/config.json). Every key is optional; environment variables and .env override this file.",
-
   "domain": "github.com",
-
-  "_domain_note": "Set this to a GitHub Enterprise host to use that tenant instead, e.g. your-tenant.ghe.com. The OAuth, token-exchange and API URLs are all derived from it.",
-
-  "oauth_file": "~/.config/copilot-proxy/oauth.txt",
-
+  "account": "YOUR_GITHUB_LOGIN",
   "port": 8787,
-
-  "bind": "127.0.0.1",
-  "_bind_note": "Loopback by default. Use 0.0.0.0 only if a container must reach it; the proxy has no authentication of its own.",
-
-  "_dump_dir_note": "Optional. Set dump_dir to write every upstream request body to disk for debugging. It contains your prompt content in the clear, so leave it unset unless you are actively debugging."
+  "bind": "127.0.0.1"
 }

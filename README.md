@@ -1,148 +1,132 @@
 # copilot-anthropic-proxy
 
-A small local shim that lets any client speaking the **Anthropic Messages API**
-do inference through **GitHub Copilot** instead of an Anthropic API key.
+A small local proxy: speak the **Anthropic Messages API** to **GitHub Copilot**.
+One Python module; `keyring` is its only direct dependency. Python 3.10+.
 
-It is ~270 lines of standard-library Python with no dependencies.
+## Run without installing globally
 
-## Why this is so small
-
-Copilot's chat endpoint serves `POST /v1/messages` in **native Anthropic wire
-format**, including SSE streaming, thinking blocks and `tool_use`. So this is
-not a translating shim. It forwards the request body byte-for-byte and only:
-
-1. **swaps auth** — callers send `x-api-key`; Copilot wants
-   `Authorization: Bearer <short-lived copilot token>` plus editor headers;
-2. **mints and refreshes** that short-lived token from a long-lived OAuth token,
-   five minutes before expiry;
-3. **rewrites the model id** — callers tend to use dashes
-   (`claude-sonnet-4-6`) where Copilot uses dots (`claude-sonnet-4.6`). An exact
-   match always wins, so this only fires when it has to.
-
-If Copilot's format ever diverges from Anthropic's, this approach stops working
-and you would need a real translation layer. Today it does not need one.
-
-## Requirements
-
-- Python 3.8+ (standard library only)
-- A GitHub account with Copilot access
-
-## Getting a credential
-
-Copilot uses a two-step exchange: a long-lived OAuth token obtained through the
-device flow, which is then exchanged for a short-lived API token. This proxy
-does the second step for you, every time. You do the first step once.
-
-The device flow uses the **public VS Code Copilot client id**,
-`Iv1.b507a08c87ecfe98`. That is not a secret; it is the same id every editor
-integration uses.
-
-```
-device code   POST https://<domain>/login/device/code
-              client_id=Iv1.b507a08c87ecfe98&scope=read:user
-
-poll          POST https://<domain>/login/oauth/access_token
-              client_id=Iv1.b507a08c87ecfe98&device_code=<code>
-              &grant_type=urn:ietf:params:oauth:grant-type:device_code
-
-exchange      GET  https://api.<domain>/copilot_internal/v2/token
-              Authorization: token <the OAuth token>
-              -> endpoints.api = the base URL this proxy forwards to
-```
-
-Approve at `https://<domain>/login/device`. **Codes expire quickly**, so do not
-leave the approval sitting.
-
-> **Use one host consistently.** If you authorise against `github.com`, exchange
-> against `api.github.com`. If you authorise against an Enterprise tenant,
-> exchange against that tenant's `api.` host. Crossing them fails in confusing
-> ways: the wrong pairing returns 403 or 404 rather than a useful error.
-
-Write the resulting OAuth token to the file the proxy reads, and keep it
-private:
+With [uv](https://docs.astral.sh/uv/), from this checkout, on Linux, Windows or macOS:
 
 ```sh
-mkdir -p ~/.config/copilot-proxy
-printf '%s' "<the-oauth-token>" > ~/.config/copilot-proxy/oauth.txt
-chmod 600 ~/.config/copilot-proxy/oauth.txt
+uvx --from . copilot-proxy --memory
 ```
 
-## Running it
+Open the printed GitHub URL, enter the code and approve. The proxy then listens
+on **http://127.0.0.1:8787**. Both credentials stay in this process; restarting
+requires approval again. No token file, keyring access or browser automation.
+`uvx` caches the package/dependencies, **not your credentials**.
+
+Memory mode also works with just Python: `python proxy.py --memory`.
+
+Once these changes are pushed, running directly from Git works too:
 
 ```sh
-python3 proxy.py
+uvx --from git+https://github.com/jack-work/copilot-proxy.git copilot-proxy --memory
 ```
 
-Point your client at `http://127.0.0.1:8787`. It answers `GET /health` and
-forwards `POST /v1/messages`.
+No PyPI publication is required. Pin the Git URL to a commit (`.git@<commit>`)
+for reproducibility. `uvx copilot-anthropic-proxy` alone is not supported unless
+the package is published, and the executable name is `copilot-proxy`.
+
+## Remember a login instead
+
+Replace `YOUR_GITHUB_LOGIN` with your GitHub username (not an email address):
+
+```sh
+uvx --from . copilot-proxy login --account YOUR_GITHUB_LOGIN
+uvx --from . copilot-proxy --account YOUR_GITHUB_LOGIN
+```
+
+Login verifies the approved account before saving the OAuth token. Storage is
+namespaced by GitHub host and account:
+
+| OS | Credential store |
+|---|---|
+| Windows | Windows Credential Manager |
+| macOS | macOS Keychain |
+| Linux / WSL | Secret Service (e.g. GNOME Keyring), with session D-Bus |
+
+The store must be available and unlocked (it may show an OS unlock prompt).
+There is **no plaintext or alternate-backend fallback**; use `--memory` if you
+do not have a usable store. This is a foreground, signed-in-user tool, not an
+unattended boot service. Windows and WSL use **separate** credential stores.
+
+Stop running proxies with Ctrl+C, then remove the saved login:
+
+```sh
+uvx --from . copilot-proxy logout --account YOUR_GITHUB_LOGIN
+```
+
+Logout removes the local credential, not GitHub's authorization grant. It
+cannot erase another process's cached token; a running keyring-backed proxy
+notices removal at its next renewal. Revoke the app on GitHub if needed.
 
 ## Configuration
 
-Highest precedence first:
+Flags override environment variables, then `.env` (`./.env` or
+`$COPILOT_PROXY_ENV`), then `$XDG_CONFIG_HOME/copilot-proxy/config.json`
+(default `~/.config/copilot-proxy/config.json`), then defaults.
 
-1. environment variables
-2. a `.env` file (`./.env`, or `$COPILOT_PROXY_ENV`)
-3. `config.json` in `$XDG_CONFIG_HOME/copilot-proxy` (default `~/.config/copilot-proxy`)
-4. built-in defaults
-
-| config.json | env var | default | meaning |
+| Flag | Environment | JSON key | Default |
 |---|---|---|---|
-| `domain` | `COPILOT_DOMAIN` | `github.com` | Host to authenticate and exchange against |
-| `oauth_file` | `COPILOT_OAUTH_FILE` | `<config dir>/oauth.txt` | Long-lived OAuth token |
-| `port` | `PORT` | `8787` | Listen port |
-| `bind` | `BIND` | `127.0.0.1` | Listen address |
-| `dump_dir` | `PROXY_DUMP_DIR` | unset | Debug tap, see below |
+| `--domain` | `COPILOT_DOMAIN` | `domain` | `github.com` |
+| `--account` | `COPILOT_ACCOUNT` | `account` | required except in memory mode |
+| `--port` | `PORT` | `port` | `8787` |
+| `--bind` | `BIND` | `bind` | `127.0.0.1` |
+| — | `PROXY_DUMP_DIR` | `dump_dir` | off |
 
-Copy `config.example.json` or `.env.example` to get started.
+`--memory` is an explicit serve-only flag. `serve` is the default command;
+`login` and `logout` manage saved credentials. `--help` lists the options.
 
-### GitHub Enterprise
+For GitHub Enterprise Cloud, add `--domain your-tenant.ghe.com` to **both**
+login and serve/logout. OAuth goes to that host and API requests to its `api.`
+host; credentials cannot be mixed across hosts. Other GitHub Enterprise
+Server URL layouts are not implemented.
 
-Set the domain to your tenant host. Everything else is derived from it:
+## Check the flow
 
-```sh
-COPILOT_DOMAIN=your-tenant.ghe.com python3 proxy.py
-```
-
-Whether that is permitted is a question for whoever administers your tenant.
-See the note at the bottom.
-
-## Two things to read before you widen anything
-
-**`bind` is loopback by default, deliberately.** This proxy holds a credential
-and has **no authentication of its own**. Anything that can reach the port can
-spend your Copilot quota. Containers that need it (Docker's
-`host.docker.internal`) require `BIND=0.0.0.0`, which makes it reachable from
-your network. Make that choice knowingly; the proxy logs a warning when you do.
-
-**`dump_dir` writes prompt content to disk in the clear.** It exists because
-TLS makes a packet capture useless and it is the only way to see the exact body
-sent upstream. It is off unless you set it. Turn it off again when you are done,
-and remember the files are plain JSON containing whatever you sent.
-
-## Running it as a service
-
-`copilot-proxy.service` is a systemd **user** unit. Adjust `WorkingDirectory`,
-then:
+From a second terminal on the same OS, with the proxy running:
 
 ```sh
-cp copilot-proxy.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now copilot-proxy
+uv run python tests/smoke.py
 ```
 
-`loginctl enable-linger $USER` keeps it running when you are not logged in.
+Or use any Anthropic-compatible client with base URL `http://127.0.0.1:8787`;
+the caller's API key is ignored. `GET /health` checks local liveness only,
+not current upstream authorization. The smoke test makes one real inference
+request (uses quota); pass `--model` if you need a different enabled model.
+If testing Windows and WSL simultaneously, use `--port 8788` for one proxy
+and pass the same port to the smoke test.
 
-## Status and caveats
+## How it works / limits
 
-- **This is a local development shim, not a product, a service, or a sanctioned
-  integration.** It is published so it can be read and reviewed rather than
-  described second-hand.
-- **Whether routing an application's inference through Copilot is permitted by
-  your Copilot licence or your organisation's policy is a question for you and
-  them, not something this repository can answer.** Check before you rely on it.
-- The editor headers and the client id it sends are the standard public Copilot
-  ones. This does not attempt to disguise itself as anything else.
-- Streaming is passed through as chunked transfer. Non-streaming responses are
-  buffered and sent with a Content-Length.
-- There is no retry logic, no rate limiting and no request queue. Upstream
-  errors are forwarded to the caller with their original status code.
+GitHub device login uses the public VS Code Copilot client ID
+`Iv1.b507a08c87ecfe98` and `read:user`. The OAuth token is exchanged at
+`/copilot_internal/v2/token` for an API token cached **only in memory**, renewed
+on demand within five minutes of expiry. Invalid OAuth credentials require
+another explicit login; HTTP handlers never initiate browser approval.
+
+Requests pass through in native Anthropic format (including SSE and tools).
+The proxy replaces authorization/editor headers and maps dashed model versions
+to Copilot's dotted IDs. An upstream 401 invalidates the cache for the **next**
+request; POSTs are never automatically replayed. No rate limiting or queueing.
+
+**Keep the loopback binding.** This proxy has no client authentication; anyone
+who can reach it can spend your quota. Widening `--bind` is your security decision.
+`dump_dir` writes prompts to disk in plaintext; leave it off unless debugging.
+
+This is an **unofficial development integration**, using Copilot's internal
+endpoint—not a sanctioned product API. Check your Copilot licence and tenant
+policy. Secure storage does not change that support boundary.
+
+## Development
+
+```sh
+uv run python -m unittest discover -s tests -v
+uv build
+```
+
+Tests mock GitHub and exercise real local HTTP forwarding, streaming, token
+renewal and failure paths. CI covers Linux, Windows and macOS. Setting
+`COPILOT_PROXY_TEST_KEYRING=1` also tests the native store with a unique dummy
+credential that is deleted afterward; it needs an unlocked keyring.

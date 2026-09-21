@@ -1,13 +1,18 @@
-# Credentials. Never commit these.
+# Never commit credentials, including files from older versions.
 oauth.txt
 ghe_oauth.txt
 *.token
 oauth.json
 .env
 
-# Local config and output.
+# Local config, builds and output.
 config.json
 proxy.log
 proxy-dump/
 __pycache__/
 *.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+uv.lock
