@@ -126,6 +126,53 @@ request (uses quota); pass `--model` if you need a different enabled model.
 If testing Windows and WSL simultaneously, use `--port 8788` for one proxy
 and pass the same port to the smoke test.
 
+## The request log
+
+`--request-log <path>` appends one JSON object per request. It records **shape
+and counts only** — never prompt text, never a token — so unlike `--dump-dir`
+it is safe to leave on. It self-rotates to one `.1` sibling at 64 MB.
+
+```json
+{"ts": 1790022751.6, "method": "POST", "path": "/v1/messages",
+ "wire": "anthropic", "client": "Anthropic/JS 0.94.0", "client_addr": "172.22.0.4",
+ "model": "claude-opus-5", "status": 200, "stream": true, "duration_ms": 5875,
+ "n_messages": 7, "system_len": 1420,
+ "input_tokens": 5953, "output_tokens": 611,
+ "cache_read": 42632, "cache_write": 3163, "prompt_total": 48585,
+ "cache_read_input_tokens": 42632, "cache_creation_input_tokens": 3163}
+```
+
+This is the only vantage point that sees both the body actually dispatched to
+the model and the usage that came back, which is what a prompt-cache change has
+to be validated against.
+
+**Use the normalized fields.** `cache_read`, `cache_write` and `prompt_total`
+are emitted next to the raw provider fields, because the two wires disagree
+twice over:
+
+| | cache read field | does `input_tokens` include cached? |
+|---|---|---|
+| Anthropic | `cache_read_input_tokens` | **no** |
+| OpenAI | `cached_tokens` | **yes** |
+
+So asking for one wire's name returns *nothing* on the other's records rather
+than an error, and `cached / input_tokens` is a hit rate on one wire and
+nonsense on the other. `cache_read / prompt_total` is correct on both:
+
+```sh
+python3 - <<'EOF'
+import json, collections
+agg = collections.defaultdict(lambda: [0, 0])
+for line in open("requests.ndjson"):
+    r = json.loads(line)
+    if "prompt_total" in r:
+        a = agg[r["wire"]]
+        a[0] += r.get("cache_read", 0); a[1] += r["prompt_total"]
+for wire, (read, total) in sorted(agg.items()):
+    print("%-18s %5.1f%% of %d prompt tokens" % (wire, 100*read/total, total))
+EOF
+```
+
 ## How it works / limits
 
 GitHub device login uses the public VS Code Copilot client ID
