@@ -18,6 +18,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
+      # The default run must NOT have keyring, so this also proves the
+      # dependency-free path stays dependency-free.
       - run: uv run python -m unittest discover -s tests -v
       - run: uv build
       - run: uvx --from . copilot-proxy --help
@@ -25,7 +27,7 @@ jobs:
         if: runner.os != 'Linux'
         env:
           COPILOT_PROXY_TEST_KEYRING: '1'
-        run: uv run python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
+        run: uv run --extra keyring python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
       - name: Native keyring (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -33,5 +35,5 @@ jobs:
           sudo apt-get install -y gnome-keyring dbus-x11
           dbus-run-session -- bash -ec '
             printf "%s" "test-only-password" | gnome-keyring-daemon --unlock --components=secrets
-            COPILOT_PROXY_TEST_KEYRING=1 uv run python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
+            COPILOT_PROXY_TEST_KEYRING=1 uv run --extra keyring python -m unittest discover -s tests -p test_proxy.py -k native_keyring_roundtrip -v
           '
