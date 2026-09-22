@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""copilot-anthropic-proxy -- speak the Anthropic Messages API to GitHub Copilot.
+"""github-copilot-proxy -- serve the Anthropic and OpenAI APIs from GitHub Copilot.
 
 Copilot's chat endpoint serves POST /v1/messages in NATIVE Anthropic wire
 format, including SSE streaming, thinking blocks and tool_use, and it also

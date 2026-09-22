@@ -1,4 +1,4 @@
-# copilot-anthropic-proxy
+# github-copilot-proxy
 
 A small local proxy: speak the **Anthropic Messages API** — and the OpenAI
 shapes Copilot also serves — to **GitHub Copilot**. One Python module;
@@ -39,7 +39,7 @@ uvx --from git+https://github.com/jack-work/copilot-proxy.git copilot-proxy --au
 ```
 
 No PyPI publication is required. Pin the Git URL to a commit (`.git@<commit>`)
-for reproducibility. `uvx copilot-anthropic-proxy` alone is not supported unless
+for reproducibility. `uvx github-copilot-proxy` alone is not supported unless
 the package is published, and the executable name is `copilot-proxy`.
 
 ## Remember a login instead

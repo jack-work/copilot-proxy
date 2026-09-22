@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "copilot-anthropic-proxy"
+name = "github-copilot-proxy"
 version = "0.2.0"
-description = "A local Anthropic/OpenAI API proxy for GitHub Copilot"
+description = "A local proxy that serves the Anthropic and OpenAI APIs from GitHub Copilot"
 readme = "README.md"
 requires-python = ">=3.10"
 # NO REQUIRED DEPENDENCIES, deliberately. --auth memory and --auth file are
@@ -21,12 +21,16 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-# `uvx --from "copilot-anthropic-proxy[keyring]"`, or install the extra, when
+# `uvx --from "github-copilot-proxy[keyring]"`, or install the extra, when
 # you want the credential in the OS store rather than memory or a file.
 keyring = ["keyring>=25,<26"]
 
 [project.scripts]
 copilot-proxy = "proxy:main"
+# Second entry point matching the distribution name, so `uvx github-copilot-proxy`
+# works without --from. uvx runs the script whose name matches the package it
+# installed; without this it errors even though the tool is installed correctly.
+github-copilot-proxy = "proxy:main"
 
 # Flat single-module layout: proxy.py sits at the repo root, not under src/, so
 # that `python3 proxy.py` keeps working for the systemd unit and the tests.

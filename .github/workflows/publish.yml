@@ -1,0 +1,66 @@
+# Publish to PyPI with Trusted Publishing (OIDC). NO API TOKEN EXISTS.
+#
+# PyPI mints a short-lived, project-scoped credential for this exact workflow
+# at run time, in exchange for a signed OIDC claim from GitHub. Nothing is
+# stored in this repository, in Actions secrets, or on any developer machine,
+# so there is no token to leak, rotate, or read. That is the point: every
+# alternative ends with a long-lived secret readable by whoever controls the
+# machine holding it.
+#
+# `id-token: write` is what lets GitHub issue that claim. It is scoped to this
+# job alone, and `contents` stays read-only.
+#
+# THE TRIGGER IS A TAG, so publishing is an explicit act rather than a
+# side effect of merging:
+#
+#     git tag v0.3.0 && git push origin v0.3.0
+#
+# The version comes from pyproject.toml, not from the tag. The guard below
+# fails the run if they disagree, because a tag that does not match the
+# artifact it publishes is a trap for whoever reads the release later.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Named environment so PyPI's publisher registration can be pinned to it,
+    # and so branch/tag protection rules can gate releases later.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+
+      # NEVER PUBLISH A RED BUILD. This gates on the test command itself, not
+      # on a pipeline that ends in tail or grep, so a failure actually stops
+      # the run.
+      - name: Test
+        run: uv run python -m unittest discover -s tests -v
+
+      - name: Build
+        run: uv build
+
+      - name: Tag matches pyproject version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(uv version --short)"
+          echo "tag=$tag pyproject=$ver"
+          test "$tag" = "$ver" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $ver"
+            exit 1
+          }
+
+      - name: Publish
+        run: uv publish --trusted-publishing always
